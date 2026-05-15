@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Zadanie 2 - czyszczenie i analiza zamowien e-commerce.
+
+Problemy z jakoscia danych widoczne w zbiorze:
+1) duplikaty wierszy,
+2) braki w kolumnach miasto, kategoria, data_zamowienia, email,
+3) niespojna wielkosc liter i spacje w tekstach,
+4) dwa formaty dat w jednej kolumnie,
+5) ceny zapisane jako tekst, z przecinkiem, spacja, waluta albo bledna wartoscia,
+6) zamowienia z iloscia 0 lub ujemna,
+7) niepoprawne adresy e-mail.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+MESSY_CSV_PATH = Path("zamowienia_messy.csv")
+CLEAN_CSV_PATH = Path("zamowienia_clean.csv")
+CHART_PATH = Path("wartosc_zamowien_miesiecznie.png")
+
+CATEGORICAL_COLUMNS = ["klient", "produkt", "kategoria", "miasto", "email"]
+EMAIL_PATTERN = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+
+QUALITY_PROBLEMS = [
+    "duplikaty wierszy",
+    "braki danych w miasto/kategoria/data_zamowienia/email",
+    "niespojna wielkosc liter i nadmiarowe spacje w tekstach",
+    "mieszane formaty dat: YYYY-MM-DD oraz DD.MM.YYYY",
+    "ceny zapisane jako tekst, z przecinkiem, spacja, waluta lub wartoscia 'abc'",
+    "niepoprawna ilosc: 0 albo wartosci ujemne",
+    "brakujace albo niepoprawne adresy e-mail",
+]
+
+
+def generate_messy_orders(n: int = 500, output_path: Path | None = None) -> pd.DataFrame:
+    """Generuje brudny zbior zamowien zgodny z poleceniem."""
+    np.random.seed(42)
+
+    klienci = [
+        "Anna Kowalska",
+        "  Jan Nowak",
+        "Anna Kowalska",
+        "PIOTR WIŚNIEWSKI",
+        "katarzyna lewandowska",
+        "Tomasz Zieliński ",
+        "Marta Wójcik",
+        "anna kowalska ",
+        "Krzysztof Kamiński",
+        " Magdalena Dąbrowska",
+    ]
+    produkty = [
+        "Laptop",
+        "Mysz",
+        "Klawiatura",
+        "Monitor",
+        "laptop",
+        "MYSZ",
+        "Słuchawki",
+        "Pendrive",
+        "monitor",
+        "Webcam",
+    ]
+    kategorie = [
+        "Elektronika",
+        "elektronika",
+        "ELEKTRONIKA",
+        "Akcesoria",
+        "akcesoria",
+        "Akcesoria ",
+    ]
+    miasta = [
+        "Warszawa",
+        "Kraków",
+        "warszawa",
+        "Gdańsk",
+        "WROCŁAW",
+        "Poznań",
+        "Łódź ",
+        " Warszawa",
+        "kraków",
+    ]
+
+    start_date = pd.Timestamp(2025, 1, 1)
+    iso_count = n // 2
+    pl_count = n - iso_count
+    daty_iso = [
+        (start_date + pd.Timedelta(days=int(day))).strftime("%Y-%m-%d")
+        for day in np.random.randint(0, 300, iso_count)
+    ]
+    daty_pl = [
+        (start_date + pd.Timedelta(days=int(day))).strftime("%d.%m.%Y")
+        for day in np.random.randint(0, 300, pl_count)
+    ]
+    daty = daty_iso + daty_pl
+    np.random.shuffle(daty)
+
+    df = pd.DataFrame(
+        {
+            "order_id": range(1001, 1001 + n),
+            "klient": np.random.choice(klienci, n),
+            "produkt": np.random.choice(produkty, n),
+            "kategoria": np.random.choice(kategorie, n),
+            "miasto": np.random.choice(miasta, n),
+            "ilosc": np.random.choice(
+                [1, 2, 3, 5, -1, 0],
+                n,
+                p=[0.5, 0.2, 0.15, 0.1, 0.025, 0.025],
+            ),
+            "cena_jednostkowa": np.random.choice(
+                ["199.99", "299,99", "1 499.00", "89.50", "2999", "399.00 zł", None, "abc"],
+                n,
+            ),
+            "data_zamowienia": daty,
+            "email": np.random.choice(
+                [
+                    "anna@gmail.com",
+                    "JAN@WP.PL",
+                    "piotr.w@onet",
+                    "marta@gmail.com",
+                    "tomasz@interia.pl",
+                    None,
+                    "krzysztof.k@gmail.com",
+                    "brak",
+                ],
+                n,
+            ),
+        }
+    )
+
+    for col in ["miasto", "kategoria", "data_zamowienia"]:
+        df.loc[df.sample(frac=0.05, random_state=1).index, col] = np.nan
+
+    duplicate_count = min(20, len(df))
+    df = pd.concat([df, df.sample(duplicate_count, random_state=2)], ignore_index=True)
+
+    if output_path is not None:
+        df.to_csv(output_path, index=False)
+
+    return df
+
+
+def load_orders(path: Path = MESSY_CSV_PATH) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def normalize_title_text(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.lower()
+        .str.title()
+    )
+
+
+def normalize_lower_text(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.lower()
+    )
+
+
+def parse_mixed_dates(series: pd.Series) -> pd.Series:
+    text_dates = series.astype("string").str.strip()
+    parsed = pd.to_datetime(text_dates, format="%Y-%m-%d", errors="coerce")
+    pl_mask = parsed.isna() & text_dates.notna()
+    parsed.loc[pl_mask] = pd.to_datetime(
+        text_dates.loc[pl_mask],
+        format="%d.%m.%Y",
+        errors="coerce",
+    )
+    return parsed
+
+
+def parse_price(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype("string")
+        .str.strip()
+        .str.replace("zl", "", regex=False)
+        .str.replace("zł", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def clean_orders(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = df.copy()
+
+    cleaned = cleaned.drop_duplicates()
+
+    cleaned["klient"] = normalize_title_text(cleaned["klient"])
+    cleaned["produkt"] = normalize_title_text(cleaned["produkt"])
+    cleaned["miasto"] = normalize_title_text(cleaned["miasto"])
+    cleaned["kategoria"] = normalize_lower_text(cleaned["kategoria"])
+
+    cleaned["data_zamowienia"] = parse_mixed_dates(cleaned["data_zamowienia"])
+    cleaned["cena_jednostkowa"] = parse_price(cleaned["cena_jednostkowa"])
+
+    cleaned["miasto"] = cleaned["miasto"].fillna("unknown")
+    cleaned["kategoria"] = cleaned["kategoria"].fillna("unknown")
+    cleaned["email"] = cleaned["email"].fillna("brak_emaila")
+
+    cleaned = cleaned.dropna(subset=["cena_jednostkowa", "data_zamowienia"])
+    cleaned = cleaned[cleaned["ilosc"] > 0].copy()
+
+    cleaned["wartosc_zamowienia"] = cleaned["ilosc"] * cleaned["cena_jednostkowa"]
+    cleaned["rok"] = cleaned["data_zamowienia"].dt.year
+    cleaned["miesiac"] = cleaned["data_zamowienia"].dt.month
+    cleaned["nazwa_dnia"] = cleaned["data_zamowienia"].dt.day_name()
+    cleaned["email_poprawny"] = (
+        cleaned["email"].astype("string").str.match(EMAIL_PATTERN).fillna(False)
+    )
+
+    return cleaned.reset_index(drop=True)
+
+
+def analyze_orders(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    monthly_total = (
+        df.assign(okres=df["data_zamowienia"].dt.to_period("M").astype(str))
+        .groupby("okres", as_index=False)
+        .agg(laczna_wartosc=("wartosc_zamowienia", "sum"))
+        .sort_values("okres")
+    )
+
+    top_customers = (
+        df.groupby("klient", as_index=False)
+        .agg(laczna_wartosc=("wartosc_zamowienia", "sum"))
+        .sort_values("laczna_wartosc", ascending=False)
+        .head(5)
+    )
+
+    category_average = (
+        df.groupby("kategoria", as_index=False)
+        .agg(srednia_wartosc_zamowienia=("wartosc_zamowienia", "mean"))
+        .sort_values("srednia_wartosc_zamowienia", ascending=False)
+    )
+
+    return {
+        "monthly_total": monthly_total,
+        "top_customers": top_customers,
+        "category_average": category_average,
+    }
+
+
+def save_monthly_bar_chart(monthly_total: pd.DataFrame, output_path: Path = CHART_PATH) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(monthly_total["okres"], monthly_total["laczna_wartosc"], color="#3B82F6")
+    ax.set_title("Laczna wartosc zamowien w kazdym miesiacu")
+    ax.set_xlabel("Miesiac")
+    ax.set_ylabel("Laczna wartosc zamowien")
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def print_exploration(df: pd.DataFrame) -> None:
+    print("=== SHAPE ===")
+    print(df.shape)
+
+    print("\n=== INFO ===")
+    df.info()
+
+    print("\n=== DESCRIBE ===")
+    print(df.describe(include="all"))
+
+    print("\n=== BRAKI DANYCH ===")
+    print(df.isnull().sum())
+
+    print("\n=== VALUE_COUNTS DLA KOLUMN KATEGORYCZNYCH ===")
+    for column in CATEGORICAL_COLUMNS:
+        print(f"\n--- {column} ---")
+        print(df[column].value_counts(dropna=False).head(15))
+
+
+def print_quality_problems() -> None:
+    print("\n=== ZIDENTYFIKOWANE PROBLEMY Z JAKOSCIA DANYCH ===")
+    for index, problem in enumerate(QUALITY_PROBLEMS, start=1):
+        print(f"{index}. {problem}")
+
+
+def print_analysis_table(title: str, table: pd.DataFrame) -> None:
+    print(f"\n=== {title} ===")
+    print(table.round(2).to_string(index=False))
+
+
+def save_outputs(cleaned: pd.DataFrame, analyses: dict[str, pd.DataFrame]) -> None:
+    cleaned.to_csv(CLEAN_CSV_PATH, index=False)
+    save_monthly_bar_chart(analyses["monthly_total"], CHART_PATH)
+
+
+def main() -> None:
+    messy = generate_messy_orders(output_path=MESSY_CSV_PATH)
+
+    print(f"Wygenerowano plik: {MESSY_CSV_PATH.resolve()} ({len(messy)} wierszy)")
+    print_exploration(messy)
+    print_quality_problems()
+
+    cleaned = clean_orders(messy)
+    analyses = analyze_orders(cleaned)
+    save_outputs(cleaned, analyses)
+
+    print(f"\nPo czyszczeniu zostalo {len(cleaned)} wierszy.")
+    print_analysis_table("Laczna wartosc zamowien w kazdym miesiacu", analyses["monthly_total"])
+    print_analysis_table("Top 5 klientow wedlug lacznej wartosci zamowien", analyses["top_customers"])
+    print_analysis_table("Srednia wartosc zamowienia w kazdej kategorii", analyses["category_average"])
+    print(f"\nOczyszczone dane zapisano do: {CLEAN_CSV_PATH.resolve()}")
+    print(f"Wykres zapisano do: {CHART_PATH.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
