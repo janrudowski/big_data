@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""Zadanie 3 - EDA rynku mieszkań w Warszawie.
+
+Skrypt:
+1) generuje plik mieszkania_warszawa.csv,
+2) wykonuje eksploracyjną analizę danych,
+3) zapisuje wymagane wykresy,
+4) wykrywa outliery metodami IQR, Z-score i Modified Z-score,
+5) usuwa nielogiczne lata budowy oraz dodaje kolumny cena_pln_capped i cena_pln_log,
+6) zapisuje raport markdown z komentarzami i wnioskami.
+"""
+
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import matplotlib
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy import stats
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+RAW_CSV_PATH = Path("mieszkania_warszawa.csv")
+CLEAN_CSV_PATH = Path("mieszkania_warszawa_clean.csv")
+REPORT_PATH = Path("raport_zadanie_3.md")
+CHARTS_DIR = Path("wykresy_zadanie_3")
+
+
+def generate_apartment_data(
+    n: int = 2000,
+    seed: int = 42,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    np.random.seed(seed)
+
+    dzielnice = [
+        "Mokotów",
+        "Wola",
+        "Śródmieście",
+        "Praga-Południe",
+        "Ursynów",
+        "Bemowo",
+        "Białołęka",
+        "Targówek",
+        "Bielany",
+        "Ochota",
+        "Wilanów",
+    ]
+    multiplikator_dzielnicy = {
+        "Mokotów": 1.15,
+        "Wola": 1.10,
+        "Śródmieście": 1.40,
+        "Praga-Południe": 0.90,
+        "Ursynów": 1.00,
+        "Bemowo": 0.95,
+        "Białołęka": 0.85,
+        "Targówek": 0.88,
+        "Bielany": 0.95,
+        "Ochota": 1.05,
+        "Wilanów": 1.20,
+    }
+
+    dzielnica = np.random.choice(dzielnice, n)
+    metraz = np.clip(np.random.normal(55, 22, n), 18, 180)
+    pokoje = np.clip(np.round(metraz / 18 + np.random.normal(0, 0.5, n)), 1, 6).astype(int)
+    pietro = np.random.randint(0, 12, n)
+    rok_budowy = np.random.choice(
+        list(range(1950, 2025)),
+        n,
+        p=np.linspace(0.5, 2, 75) / np.linspace(0.5, 2, 75).sum(),
+    )
+    ma_balkon = np.random.choice([True, False], n, p=[0.75, 0.25])
+    ma_miejsce_parkingowe = np.random.choice([True, False], n, p=[0.45, 0.55])
+    odleglosc_od_centrum = np.clip(np.random.gamma(2.5, 2.5, n), 0.5, 25)
+
+    cena_za_m2 = (
+        14000
+        * np.array([multiplikator_dzielnicy[d] for d in dzielnica])
+        * (1 + 0.005 * (rok_budowy - 1980))
+        * (1 - 0.015 * odleglosc_od_centrum)
+        * (1 + 0.05 * ma_balkon)
+        * (1 + 0.08 * ma_miejsce_parkingowe)
+        + np.random.normal(0, 1500, n)
+    )
+    cena = (cena_za_m2 * metraz).round(0)
+
+    df = pd.DataFrame(
+        {
+            "id_oferty": range(10001, 10001 + n),
+            "dzielnica": dzielnica,
+            "metraz_m2": metraz.round(1),
+            "liczba_pokoi": pokoje,
+            "pietro": pietro,
+            "rok_budowy": rok_budowy,
+            "ma_balkon": ma_balkon,
+            "ma_miejsce_parkingowe": ma_miejsce_parkingowe,
+            "odleglosc_od_centrum_km": odleglosc_od_centrum.round(2),
+            "cena_pln": cena,
+        }
+    )
+
+    outlier_idx = np.random.choice(df.index, 30, replace=False)
+    df.loc[outlier_idx[:10], "cena_pln"] *= np.random.uniform(5, 12, 10)
+    df.loc[outlier_idx[10:20], "cena_pln"] *= np.random.uniform(0.05, 0.2, 10)
+    df.loc[outlier_idx[20:25], "metraz_m2"] = np.random.uniform(300, 600, 5)
+    df.loc[outlier_idx[25:30], "rok_budowy"] = np.random.choice([1800, 1850, 2050, 2099], 5)
+
+    if output_path is not None:
+        df.to_csv(output_path, index=False)
+
+    return df
+
+
+def load_apartment_data(path: Path = RAW_CSV_PATH) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def add_price_per_m2(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
+    enriched["cena_pln_per_m2"] = enriched["cena_pln"] / enriched["metraz_m2"]
+    return enriched
+
+
+def dataframe_info_text(df: pd.DataFrame) -> str:
+    buffer = io.StringIO()
+    df.info(buf=buffer)
+    return buffer.getvalue()
+
+
+def suspicious_observations(df: pd.DataFrame) -> list[str]:
+    return [
+        (
+            "Maksymalna cena jest wielokrotnie większa od mediany, "
+            "co sugeruje drogie penthouse'y lub błędy w cenie."
+        ),
+        (
+            "Minimalna cena jest bardzo niska względem mediany, "
+            "co wygląda jak błąd danych albo podejrzana oferta."
+        ),
+        (
+            "Maksymalny metraż przekracza 300 m2, więc w zbiorze są "
+            "gigantyczne mieszkania odstające od typowych lokali."
+        ),
+        (
+            f"Lata budowy poza zakresem 1900-2026: {int(invalid_year_mask(df).sum())} "
+            "wierszy wymagających usunięcia."
+        ),
+    ]
+
+
+def exploration_summary(df: pd.DataFrame) -> dict[str, object]:
+    return {
+        "shape": df.shape,
+        "info": dataframe_info_text(df),
+        "describe": df.describe(include="all"),
+        "missing_values": df.isnull().sum(),
+        "suspicious_observations": suspicious_observations(df),
+    }
+
+
+def descriptive_statistics(df: pd.DataFrame) -> dict[str, object]:
+    q1 = df["metraz_m2"].quantile(0.25)
+    q3 = df["metraz_m2"].quantile(0.75)
+
+    return {
+        "price_stats": {
+            "mean": df["cena_pln"].mean(),
+            "median": df["cena_pln"].median(),
+            "std": df["cena_pln"].std(),
+            "skewness": df["cena_pln"].skew(),
+            "kurtosis": df["cena_pln"].kurt(),
+        },
+        "area_iqr": {
+            "q1": q1,
+            "q3": q3,
+            "iqr": q3 - q1,
+        },
+        "unique_district_count": df["dzielnica"].nunique(),
+        "district_counts": df["dzielnica"].value_counts(),
+    }
+
+
+def iqr_outlier_mask(series: pd.Series, multiplier: float = 1.5) -> pd.Series:
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    return (series < q1 - multiplier * iqr) | (series > q3 + multiplier * iqr)
+
+
+def zscore_outlier_mask(series: pd.Series, threshold: float = 3.0) -> pd.Series:
+    z_scores = stats.zscore(series, nan_policy="omit")
+    return pd.Series(np.abs(z_scores) > threshold, index=series.index)
+
+
+def modified_zscore(series: pd.Series) -> pd.Series:
+    median = series.median()
+    mad = (series - median).abs().median()
+
+    if mad == 0:
+        return pd.Series(np.zeros(len(series)), index=series.index)
+
+    return 0.6745 * (series - median) / mad
+
+
+def modified_zscore_outlier_mask(series: pd.Series, threshold: float = 3.5) -> pd.Series:
+    return modified_zscore(series).abs() > threshold
+
+
+def invalid_year_mask(df: pd.DataFrame) -> pd.Series:
+    return (df["rok_budowy"] < 1900) | (df["rok_budowy"] > 2026)
+
+
+def detect_outliers(df: pd.DataFrame) -> dict[str, pd.Series]:
+    return {
+        "cena_iqr": iqr_outlier_mask(df["cena_pln"]),
+        "cena_zscore": zscore_outlier_mask(df["cena_pln"]),
+        "cena_modified_zscore": modified_zscore_outlier_mask(df["cena_pln"]),
+        "metraz_iqr": iqr_outlier_mask(df["metraz_m2"]),
+    }
+
+
+def clean_apartment_data(df: pd.DataFrame) -> pd.DataFrame:
+    cleaned = add_price_per_m2(df)
+    cleaned = cleaned.loc[~invalid_year_mask(cleaned)].copy()
+
+    lower_cap = cleaned["cena_pln"].quantile(0.01)
+    upper_cap = cleaned["cena_pln"].quantile(0.99)
+    cleaned["cena_pln_capped"] = cleaned["cena_pln"].clip(lower_cap, upper_cap)
+    cleaned["cena_pln_log"] = np.log1p(cleaned["cena_pln"])
+
+    return cleaned.reset_index(drop=True)
+
+
+def correlation_analysis(df: pd.DataFrame) -> dict[str, object]:
+    corr_df = add_price_per_m2(df)
+    corr_df["ma_balkon"] = corr_df["ma_balkon"].astype(int)
+    corr_df["ma_miejsce_parkingowe"] = corr_df["ma_miejsce_parkingowe"].astype(int)
+    correlation_matrix = corr_df.select_dtypes(include="number").corr()
+    price_correlations = (
+        correlation_matrix["cena_pln"]
+        .drop(labels=["cena_pln", "cena_pln_per_m2"])
+        .abs()
+        .sort_values(ascending=False)
+    )
+
+    strongest_variable = price_correlations.index[0]
+    strongest_value = correlation_matrix.loc[strongest_variable, "cena_pln"]
+    district_price_per_m2 = (
+        corr_df.groupby("dzielnica")["cena_pln_per_m2"]
+        .median()
+        .sort_values(ascending=False)
+    )
+
+    return {
+        "correlation_matrix": correlation_matrix,
+        "strongest_price_correlation": (strongest_variable, strongest_value),
+        "district_price_per_m2_median": district_price_per_m2,
+        "highest_price_per_m2_district": district_price_per_m2.index[0],
+    }
+
+
+def build_conclusions(
+    analysis: dict[str, object],
+    outliers: dict[str, pd.Series],
+    cleaned: pd.DataFrame,
+) -> list[str]:
+    price_stats = analysis["price_stats"]
+    strongest_variable, strongest_value = analysis["strongest_price_correlation"]
+    highest_district = analysis["highest_price_per_m2_district"]
+
+    return [
+        (
+            "Rozkład cen jest prawostronnie skośny: średnia "
+            f"({price_stats['mean']:.0f} PLN) jest wyższa niż mediana "
+            f"({price_stats['median']:.0f} PLN), a skewness wynosi "
+            f"{price_stats['skewness']:.2f}."
+        ),
+        (
+            "Najsilniejszy związek z ceną ma zmienna "
+            f"{strongest_variable} (korelacja {strongest_value:.2f}), "
+            "co pokazuje, że cena całkowita zależy głównie od cech ilościowych lokalu."
+        ),
+        (
+            f"Najwyższą medianę ceny za m2 ma dzielnica {highest_district}; "
+            "porównywanie ceny za m2 jest bardziej uczciwe niż porównywanie cen całkowitych."
+        ),
+        (
+            "Metody outlierów wykrywają różne skale problemu: IQR dla ceny znalazł "
+            f"{int(outliers['cena_iqr'].sum())} obserwacji, Z-score "
+            f"{int(outliers['cena_zscore'].sum())}, a Modified Z-score "
+            f"{int(outliers['cena_modified_zscore'].sum())}."
+        ),
+        (
+            "Po usunięciu nielogicznych lat budowy zostało "
+            f"{len(cleaned)} ofert; winsoryzacja ogranicza wpływ ekstremalnych cen, "
+            "a logarytmizacja zmniejsza skośność rozkładu."
+        ),
+    ]
+
+
+def analyze_apartments(df: pd.DataFrame) -> dict[str, object]:
+    analysis: dict[str, object] = {}
+    analysis.update(exploration_summary(df))
+    analysis.update(descriptive_statistics(df))
+    analysis.update(correlation_analysis(df))
+
+    outliers = detect_outliers(df)
+    cleaned = clean_apartment_data(df)
+    analysis["outliers"] = outliers
+    analysis["invalid_year_rows"] = df.loc[invalid_year_mask(df)]
+    analysis["top_5_largest_areas"] = df.sort_values("metraz_m2", ascending=False).head(5)
+    analysis["cleaned_shape"] = cleaned.shape
+    analysis["skewness_before_log"] = cleaned["cena_pln"].skew()
+    analysis["skewness_after_log"] = cleaned["cena_pln_log"].skew()
+    analysis["conclusions"] = build_conclusions(analysis, outliers, cleaned)
+
+    return analysis
+
+
+def save_charts(
+    df: pd.DataFrame,
+    cleaned: pd.DataFrame,
+    analysis: dict[str, object],
+    output_dir: Path = CHARTS_DIR,
+) -> list[Path]:
+    sns.set_theme(style="whitegrid")
+    output_dir.mkdir(exist_ok=True)
+    enriched = add_price_per_m2(df)
+    saved_paths: list[Path] = []
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sns.histplot(df["cena_pln"], bins=40, kde=True, ax=axes[0])
+    axes[0].set_title("Rozkład ceny mieszkań")
+    sns.histplot(df["metraz_m2"], bins=40, kde=True, ax=axes[1])
+    axes[1].set_title("Rozkład metrażu")
+    fig.tight_layout()
+    path = output_dir / "01_histogramy_cena_metraz.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    sns.boxplot(x=df["cena_pln"], ax=ax)
+    ax.set_title("Boxplot ceny mieszkań")
+    fig.tight_layout()
+    path = output_dir / "02_boxplot_cena.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    district_order = df["dzielnica"].value_counts().index
+    sns.countplot(data=df, x="dzielnica", order=district_order, ax=ax)
+    ax.set_title("Liczba ofert w dzielnicach")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    path = output_dir / "03_countplot_dzielnice.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(
+        analysis["correlation_matrix"],
+        annot=True,
+        cmap="coolwarm",
+        center=0,
+        fmt=".2f",
+        ax=ax,
+    )
+    ax.set_title("Macierz korelacji zmiennych numerycznych")
+    fig.tight_layout()
+    path = output_dir / "04_heatmapa_korelacji.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    sns.scatterplot(
+        data=enriched,
+        x="metraz_m2",
+        y="cena_pln",
+        hue="dzielnica",
+        alpha=0.65,
+        ax=ax,
+    )
+    ax.set_title("Metraż vs cena mieszkań")
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+    path = output_dir / "05_scatter_metraz_cena.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    district_medians = analysis["district_price_per_m2_median"]
+    sns.boxplot(
+        data=enriched,
+        x="dzielnica",
+        y="cena_pln_per_m2",
+        order=district_medians.index,
+        ax=ax,
+    )
+    ax.set_title("Cena za m2 w podziale na dzielnice")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    path = output_dir / "06_boxplot_cena_m2_dzielnice.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sns.histplot(cleaned["cena_pln"], bins=40, kde=True, ax=axes[0])
+    axes[0].set_title("Cena przed logarytmizacją")
+    sns.histplot(cleaned["cena_pln_log"], bins=40, kde=True, ax=axes[1])
+    axes[1].set_title("Cena po log1p")
+    fig.tight_layout()
+    path = output_dir / "07_porownanie_log_ceny.png"
+    fig.savefig(path)
+    saved_paths.append(path)
+    plt.close(fig)
+
+    return saved_paths
+
+
+def save_report(
+    df: pd.DataFrame,
+    cleaned: pd.DataFrame,
+    analysis: dict[str, object],
+    chart_paths: list[Path],
+    output_path: Path = REPORT_PATH,
+) -> None:
+    price_stats = analysis["price_stats"]
+    area_iqr = analysis["area_iqr"]
+    outliers = analysis["outliers"]
+    strongest_variable, strongest_value = analysis["strongest_price_correlation"]
+
+    lines = [
+        "# Raport - Zadanie 3",
+        "",
+        "## Część 1 - Wstępna eksploracja",
+        f"- Shape: {analysis['shape']}",
+        "- Braki danych:",
+        analysis["missing_values"].to_string(),
+        "",
+        "Podejrzane obserwacje ze statystyk opisowych:",
+        *[f"- {item}" for item in analysis["suspicious_observations"]],
+        "",
+        "## Część 2 - Statystyki opisowe",
+        f"- Średnia cena: {price_stats['mean']:.2f} PLN",
+        f"- Mediana ceny: {price_stats['median']:.2f} PLN",
+        f"- Odchylenie standardowe ceny: {price_stats['std']:.2f} PLN",
+        f"- Skewness ceny: {price_stats['skewness']:.2f}",
+        f"- Kurtosis ceny: {price_stats['kurtosis']:.2f}",
+        (
+            "- Komentarz: dodatnia skośność oznacza długi prawy ogon, "
+            "czyli część ofert ma wyjątkowo wysokie ceny."
+        ),
+        f"- Metraż Q1: {area_iqr['q1']:.2f} m2",
+        f"- Metraż Q3: {area_iqr['q3']:.2f} m2",
+        f"- Metraż IQR: {area_iqr['iqr']:.2f} m2",
+        f"- Liczba dzielnic: {analysis['unique_district_count']}",
+        "",
+        "Liczba ofert w dzielnicach:",
+        analysis["district_counts"].to_string(),
+        "",
+        "## Część 3 - Analiza pojedynczych zmiennych",
+        "- Histogramy ceny i metrażu pokazują prawostronną skośność oraz obserwacje odstające.",
+        "- Boxplot ceny pokazuje bardzo wysokie punkty odstające.",
+        "- Countplot dzielnic zapisano z kolejnością malejącą według liczby ofert.",
+        "",
+        "## Część 4 - Analiza zależności",
+        (
+            f"- Najsilniejsza korelacja z ceną: {strongest_variable} "
+            f"({strongest_value:.2f})."
+        ),
+        (
+            f"- Najwyższa mediana ceny za m2: "
+            f"{analysis['highest_price_per_m2_district']}."
+        ),
+        "",
+        "## Część 5 - Detekcja outlierów",
+        f"- Cena IQR 1.5x: {int(outliers['cena_iqr'].sum())} outlierów",
+        f"- Cena Z-score |z| > 3: {int(outliers['cena_zscore'].sum())} outlierów",
+        (
+            "- Cena Modified Z-score |z_mod| > 3.5: "
+            f"{int(outliers['cena_modified_zscore'].sum())} outlierów"
+        ),
+        f"- Metraż IQR: {int(outliers['metraz_iqr'].sum())} outlierów",
+        "",
+        "Top 5 największych metraży:",
+        analysis["top_5_largest_areas"][
+            ["id_oferty", "dzielnica", "metraz_m2", "cena_pln"]
+        ].to_string(index=False),
+        "",
+        "Wiersze z nielogicznym rokiem budowy:",
+        analysis["invalid_year_rows"][
+            ["id_oferty", "dzielnica", "rok_budowy", "cena_pln"]
+        ].to_string(index=False),
+        "",
+        "## Część 6 - Decyzja i czyszczenie",
+        f"- Liczba wierszy przed czyszczeniem: {len(df)}",
+        f"- Liczba wierszy po usunięciu nielogicznych lat: {len(cleaned)}",
+        "- Dodano kolumnę `cena_pln_capped` z capem na 1 i 99 percentylu.",
+        "- Dodano kolumnę `cena_pln_log` = log1p(cena_pln).",
+        f"- Skewness przed logarytmizacją: {analysis['skewness_before_log']:.2f}",
+        f"- Skewness po logarytmizacji: {analysis['skewness_after_log']:.2f}",
+        "",
+        "## Wykresy",
+        *[f"- {path.as_posix()}" for path in chart_paths],
+        "",
+        "## Część 7 - Wnioski",
+        *[f"- {conclusion}" for conclusion in analysis["conclusions"]],
+        "",
+    ]
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def print_analysis(analysis: dict[str, object]) -> None:
+    price_stats = analysis["price_stats"]
+    area_iqr = analysis["area_iqr"]
+    outliers = analysis["outliers"]
+    strongest_variable, strongest_value = analysis["strongest_price_correlation"]
+
+    print("=== WSTĘPNA EKSPLORACJA ===")
+    print(f"Shape: {analysis['shape']}")
+    print("\nBraki danych:")
+    print(analysis["missing_values"])
+    print("\nPodejrzane obserwacje:")
+    for item in analysis["suspicious_observations"]:
+        print(f"- {item}")
+
+    print("\n=== STATYSTYKI OPISOWE ===")
+    print(f"Średnia cena: {price_stats['mean']:.2f}")
+    print(f"Mediana ceny: {price_stats['median']:.2f}")
+    print(f"Odchylenie standardowe ceny: {price_stats['std']:.2f}")
+    print(f"Skewness ceny: {price_stats['skewness']:.2f}")
+    print(f"Kurtosis ceny: {price_stats['kurtosis']:.2f}")
+    print(f"Metraż Q1/Q3/IQR: {area_iqr['q1']:.2f} / {area_iqr['q3']:.2f} / {area_iqr['iqr']:.2f}")
+    print(f"Liczba dzielnic: {analysis['unique_district_count']}")
+
+    print("\n=== ZALEŻNOŚCI ===")
+    print(f"Najsilniejsza korelacja z ceną: {strongest_variable} ({strongest_value:.2f})")
+    print(f"Najwyższa cena za m2: {analysis['highest_price_per_m2_district']}")
+
+    print("\n=== OUTLIERY ===")
+    print(f"Cena IQR: {int(outliers['cena_iqr'].sum())}")
+    print(f"Cena Z-score: {int(outliers['cena_zscore'].sum())}")
+    print(f"Cena Modified Z-score: {int(outliers['cena_modified_zscore'].sum())}")
+    print(f"Metraż IQR: {int(outliers['metraz_iqr'].sum())}")
+    print(f"Nielogiczne lata budowy: {len(analysis['invalid_year_rows'])}")
+
+    print("\n=== WNIOSKI ===")
+    for conclusion in analysis["conclusions"]:
+        print(f"- {conclusion}")
+
+
+def main() -> None:
+    df = generate_apartment_data(output_path=RAW_CSV_PATH)
+    analysis = analyze_apartments(df)
+    cleaned = clean_apartment_data(df)
+    chart_paths = save_charts(df, cleaned, analysis)
+
+    cleaned.to_csv(CLEAN_CSV_PATH, index=False)
+    save_report(df, cleaned, analysis, chart_paths)
+    print_analysis(analysis)
+    print(f"\nZapisano dane surowe: {RAW_CSV_PATH.resolve()}")
+    print(f"Zapisano dane po czyszczeniu: {CLEAN_CSV_PATH.resolve()}")
+    print(f"Zapisano raport: {REPORT_PATH.resolve()}")
+    print(f"Zapisano wykresy w katalogu: {CHARTS_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
