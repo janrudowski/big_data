@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Zadanie 4 - Wizualizacja rynku koncertów muzycznych w Polsce (plotly).
+
+Skrypt:
+1) generuje plik koncerty_polska.csv (skrypt z treści zadania),
+2) wczytuje dane i robi wstępną eksplorację,
+3) buduje interaktywne wykresy plotly (każdy jako osobna funkcja -> go.Figure),
+4) zapisuje wykresy jako pliki HTML w katalogu wykresy_zadanie_4/,
+5) zapisuje raport markdown z komentarzami i wnioskami.
+
+Uruchomienie: uv run --with pandas,plotly python zadanie_4
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR / "koncerty_polska.csv"
+WYKRESY_DIR = BASE_DIR / "wykresy_zadanie_4"
+RAPORT_PATH = BASE_DIR / "raport_zadanie_4.md"
+
+
+# ---------------------------------------------------------------------------
+# Generowanie danych (skrypt z treści zadania)
+# ---------------------------------------------------------------------------
+
+def generuj_dane() -> None:
+    np.random.seed(42)
+
+    n = 1200
+
+    miasta = {
+        "Warszawa":   (52.2297, 21.0122, 1.00),
+        "Kraków":     (50.0647, 19.9450, 0.75),
+        "Wrocław":    (51.1079, 17.0385, 0.65),
+        "Poznań":     (52.4064, 16.9252, 0.55),
+        "Gdańsk":     (54.3520, 18.6466, 0.55),
+        "Łódź":       (51.7592, 19.4560, 0.50),
+        "Katowice":   (50.2649, 19.0238, 0.45),
+        "Lublin":     (51.2465, 22.5684, 0.30),
+        "Białystok":  (53.1325, 23.1688, 0.25),
+        "Szczecin":   (53.4285, 14.5528, 0.35),
+    }
+
+    gatunki = ["rock", "pop", "hip-hop", "electronic", "jazz",
+               "classical", "folk", "metal", "indie", "reggae"]
+
+    typy_obiektow = ["klub", "arena", "stadion", "festiwal", "teatr", "amfiteatr"]
+    kapacjety = {
+        "klub": (200, 1500), "arena": (3000, 15000), "stadion": (20000, 70000),
+        "festiwal": (10000, 80000), "teatr": (400, 2000), "amfiteatr": (1500, 8000),
+    }
+    cena_bazowa = {
+        "rock": 150, "pop": 200, "hip-hop": 180, "electronic": 160, "jazz": 130,
+        "classical": 110, "folk": 90, "metal": 140, "indie": 100, "reggae": 110,
+    }
+    cena_mnoznik = {
+        "klub": 0.7, "arena": 1.3, "stadion": 1.8,
+        "festiwal": 1.5, "teatr": 1.2, "amfiteatr": 1.0,
+    }
+
+    start_date = datetime(2024, 1, 1)
+    daty = [start_date + timedelta(days=int(d)) for d in np.random.randint(0, 730, n)]
+
+    wagi = np.array([miasta[m][2] for m in miasta])
+    miasto = np.random.choice(list(miasta.keys()), n, p=wagi / wagi.sum())
+    gatunek = np.random.choice(gatunki, n)
+    typ_obiektu = np.random.choice(typy_obiektow, n,
+                                   p=[0.40, 0.15, 0.05, 0.10, 0.15, 0.15])
+
+    pojemnosc = np.array([np.random.randint(*kapacjety[t]) for t in typ_obiektu])
+    wypelnienie = np.clip(np.random.beta(5, 2, n), 0.15, 1.0)
+    sprzedane = (pojemnosc * wypelnienie).astype(int)
+
+    cena = np.array([cena_bazowa[g] * cena_mnoznik[t] for g, t in zip(gatunek, typ_obiektu)])
+    cena = np.round(cena * np.random.uniform(0.7, 1.4, n), -1)
+    przychod = (cena * sprzedane).astype(int)
+
+    df = pd.DataFrame({
+        "event_id": range(50001, 50001 + n),
+        "data": daty,
+        "miasto": miasto,
+        "latitude": [miasta[m][0] for m in miasto],
+        "longitude": [miasta[m][1] for m in miasto],
+        "gatunek": gatunek,
+        "typ_obiektu": typ_obiektu,
+        "pojemnosc": pojemnosc,
+        "bilety_sprzedane": sprzedane,
+        "cena_biletu_pln": cena,
+        "przychod_pln": przychod,
+    })
+
+    df.to_csv(CSV_PATH, index=False)
+    print(f"Wygenerowano plik 'koncerty_polska.csv' — {len(df)} koncertów")
+
+
+# ---------------------------------------------------------------------------
+# Część 1 — Wczytanie i wstępna eksploracja
+# ---------------------------------------------------------------------------
+
+def czesc_1_eksploracja() -> pd.DataFrame:
+    df = pd.read_csv(CSV_PATH, parse_dates=["data"])
+
+    print("=== Część 1: wstępna eksploracja ===")
+    print(f"shape: {df.shape}")
+    print("\nhead():")
+    print(df.head())
+    print("\ndtypes:")
+    print(df.dtypes)
+    print(f"\nUnikalne miasta: {df['miasto'].nunique()} -> {sorted(df['miasto'].unique())}")
+    print(f"Unikalne gatunki: {df['gatunek'].nunique()} -> {sorted(df['gatunek'].unique())}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Część 2 — Wykres słupkowy: przychód wg miasta
+# ---------------------------------------------------------------------------
+
+def plot_przychod_wg_miasta(df: pd.DataFrame) -> go.Figure:
+    przychod = (df.groupby("miasto", as_index=False)["przychod_pln"].sum()
+                  .sort_values("przychod_pln", ascending=False))
+    fig = px.bar(
+        przychod, x="miasto", y="przychod_pln",
+        title="Łączny przychód z koncertów wg miasta (2024–2025)",
+        labels={"miasto": "Miasto", "przychod_pln": "Łączny przychód [PLN]"},
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Część 3 — Wykresy liniowe: koncerty miesięcznie
+# ---------------------------------------------------------------------------
+
+def plot_koncerty_miesiecznie(df: pd.DataFrame) -> go.Figure:
+    miesiac = df["data"].dt.to_period("M").astype(str)
+    licznosc = miesiac.value_counts().sort_index().rename_axis("miesiac").reset_index(name="liczba_koncertow")
+    fig = px.line(
+        licznosc, x="miesiac", y="liczba_koncertow", markers=True,
+        title="Liczba koncertów w Polsce w poszczególnych miesiącach",
+        labels={"miesiac": "Miesiąc", "liczba_koncertow": "Liczba koncertów"},
+    )
+    return fig
+
+
+def plot_koncerty_miesiecznie_wg_typu(df: pd.DataFrame) -> go.Figure:
+    tmp = df.assign(miesiac=df["data"].dt.to_period("M").astype(str))
+    licznosc = (tmp.groupby(["miesiac", "typ_obiektu"], as_index=False)
+                   .size().rename(columns={"size": "liczba_koncertow"}))
+    fig = px.line(
+        licznosc, x="miesiac", y="liczba_koncertow", color="typ_obiektu",
+        title="Miesięczna liczba koncertów wg typu obiektu",
+        labels={"miesiac": "Miesiąc", "liczba_koncertow": "Liczba koncertów",
+                "typ_obiektu": "Typ obiektu"},
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Część 4 — Histogram i boxplot
+# ---------------------------------------------------------------------------
+
+def plot_histogram_cen(df: pd.DataFrame) -> go.Figure:
+    # Testowane nbins: 20 (za grube kosze), 100 (poszarpany) — 50 najlepiej
+    # pokazuje prawostronnie skośny rozkład z ogonem drogich biletów.
+    fig = px.histogram(
+        df, x="cena_biletu_pln", nbins=50,
+        title="Rozkład cen biletów na koncerty (nbins=50)",
+        labels={"cena_biletu_pln": "Cena biletu [PLN]"},
+    )
+    fig.update_layout(yaxis_title="Liczba koncertów")
+    return fig
+
+
+def plot_boxplot_przychodu(df: pd.DataFrame) -> go.Figure:
+    fig = px.box(
+        df, x="typ_obiektu", y="przychod_pln",
+        title="Przychód z pojedynczego koncertu wg typu obiektu",
+        labels={"typ_obiektu": "Typ obiektu", "przychod_pln": "Przychód [PLN]"},
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Część 5 — Scatter plot z kodowaniem koloru
+# ---------------------------------------------------------------------------
+
+def plot_scatter_cena_wypelnienie(df: pd.DataFrame) -> go.Figure:
+    fig = px.scatter(
+        df, x="cena_biletu_pln", y="wypelnienie",
+        color="gatunek", size="pojemnosc",
+        hover_data=["miasto", "typ_obiektu"],
+        title="Cena biletu a wypełnienie sali (kolor: gatunek, rozmiar: pojemność)",
+        labels={"cena_biletu_pln": "Cena biletu [PLN]",
+                "wypelnienie": "Wypełnienie sali", "gatunek": "Gatunek",
+                "pojemnosc": "Pojemność"},
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Część 6 — Mapa
+# ---------------------------------------------------------------------------
+
+def agreguj_miasta(df: pd.DataFrame) -> pd.DataFrame:
+    return (df.groupby("miasto", as_index=False)
+              .agg(latitude=("latitude", "first"),
+                   longitude=("longitude", "first"),
+                   srednia_cena_pln=("cena_biletu_pln", "mean"),
+                   liczba_koncertow=("event_id", "count"),
+                   laczny_przychod_pln=("przychod_pln", "sum"))
+              .round({"srednia_cena_pln": 2}))
+
+
+def plot_mapa_miast(df: pd.DataFrame) -> go.Figure:
+    miasta = agreguj_miasta(df)
+    fig = px.scatter_mapbox(
+        miasta, lat="latitude", lon="longitude",
+        size="liczba_koncertow", color="srednia_cena_pln",
+        hover_name="miasto",
+        hover_data={"liczba_koncertow": True, "srednia_cena_pln": True,
+                    "laczny_przychod_pln": True,
+                    "latitude": False, "longitude": False},
+        mapbox_style="open-street-map", zoom=5, height=700,
+        title="Koncerty w polskich miastach (rozmiar: liczba, kolor: średnia cena)",
+        labels={"liczba_koncertow": "Liczba koncertów",
+                "srednia_cena_pln": "Średnia cena [PLN]",
+                "laczny_przychod_pln": "Łączny przychód [PLN]"},
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Część 7 — Subploty 2×2
+# ---------------------------------------------------------------------------
+
+def plot_subploty(df: pd.DataFrame) -> go.Figure:
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Przychód wg miasta", "Liczba koncertów wg gatunku",
+                        "Rozkład cen biletów", "Wypełnienie wg typu obiektu"),
+    )
+
+    przychod = (df.groupby("miasto")["przychod_pln"].sum()
+                  .sort_values(ascending=False))
+    fig.add_trace(go.Bar(x=przychod.index, y=przychod.values), row=1, col=1)
+
+    gatunki = df["gatunek"].value_counts()
+    fig.add_trace(go.Bar(x=gatunki.index, y=gatunki.values), row=1, col=2)
+
+    fig.add_trace(go.Histogram(x=df["cena_biletu_pln"], nbinsx=50), row=2, col=1)
+
+    for typ, grupa in df.groupby("typ_obiektu"):
+        fig.add_trace(go.Box(y=grupa["wypelnienie"], name=typ), row=2, col=2)
+
+    fig.update_layout(
+        title_text="Rynek koncertów w Polsce 2024–2025 — podsumowanie",
+        showlegend=False, height=800,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Raport markdown (komentarze do cz. 4 i 5 + wnioski cz. 8)
+# ---------------------------------------------------------------------------
+
+def zapisz_raport(df: pd.DataFrame) -> None:
+    mediana_przychodu = (df.groupby("typ_obiektu")["przychod_pln"].median()
+                           .sort_values(ascending=False))
+    top_typ = mediana_przychodu.index[0]
+    korelacja = df["cena_biletu_pln"].corr(df["wypelnienie"])
+    top_miasto = df["miasto"].value_counts().index[0]
+    top_miasto_n = df["miasto"].value_counts().iloc[0]
+    ceny_typ = (df.groupby("typ_obiektu")["cena_biletu_pln"].mean()
+                  .sort_values(ascending=False))
+    miesiace = df["data"].dt.month.value_counts().sort_index()
+    duze = df["typ_obiektu"].isin(["stadion", "festiwal"])
+    udzial_imprez = duze.mean()
+    udzial_przychodu = df.loc[duze, "przychod_pln"].sum() / df["przychod_pln"].sum()
+
+    raport = f"""# Raport — Zadanie 4: Wizualizacja rynku koncertów w Polsce
+
+Interaktywne wykresy (HTML, plotly) znajdują się w katalogu `wykresy_zadanie_4/`.
+
+## Komentarz do części 4 (histogram + boxplot)
+
+Testowane wartości `nbins`: 20, 50 i 100. Wartość **50** najlepiej pokazuje
+kształt rozkładu — 20 koszy zlewa szczegóły, a 100 daje poszarpany wykres.
+Rozkład cen biletów jest **prawostronnie skośny**: większość biletów kosztuje
+do ~250 PLN, a długi ogon tworzą drogie koncerty stadionowe i festiwalowe.
+
+Najwyższe przychody z pojedynczego koncertu generują obiekty typu
+**{top_typ}** (mediana ~{mediana_przychodu.iloc[0]:,.0f} PLN) — duża pojemność
+mnoży się przez wysokie ceny biletów. Kluby i teatry, mimo największej liczby
+imprez, mają o rzędy wielkości niższe przychody jednostkowe.
+
+## Komentarz do części 5 (scatter)
+
+Współczynnik korelacji między ceną biletu a wypełnieniem sali wynosi
+**{korelacja:.3f}** — praktycznie brak zależności. Wypełnienie sali jest
+podobne w całym zakresie cen, co sugeruje, że popyt zależy od artysty
+i wydarzenia, a nie od samej ceny biletu.
+
+## Wnioski (część 8)
+
+1. **{top_miasto} dominuje na rynku** — najwięcej koncertów
+   ({top_miasto_n}) i najwyższy łączny przychód; kolejne są Kraków i Wrocław,
+   co odpowiada wielkości tych miast.
+2. **Najwyższe ceny biletów są na stadionach** (średnio
+   ~{ceny_typ.iloc[0]:,.0f} PLN) i festiwalach — mnożnik prestiżu i skali;
+   najtańsze są koncerty klubowe (~{ceny_typ.iloc[-1]:,.0f} PLN).
+3. **Przychody napędzają wielkie obiekty**: stadiony i festiwale to tylko
+   {udzial_imprez:.0%} imprez, ale generują {udzial_przychodu:.0%} przychodu.
+4. **Brak wyraźnej sezonowości** — liczba koncertów w miesiącach waha się
+   losowo (od {miesiace.min()} do {miesiace.max()} rocznie na miesiąc),
+   bo daty w zbiorze są losowane jednostajnie; w prawdziwych danych
+   spodziewalibyśmy się szczytu festiwalowego latem.
+5. **Cena nie steruje frekwencją** — brak korelacji ceny z wypełnieniem sali
+   oznacza, że organizatorzy mają przestrzeń do optymalizacji cen bez ryzyka
+   pustych sal.
+"""
+    RAPORT_PATH.write_text(raport, encoding="utf-8")
+    print(f"\nZapisano raport: {RAPORT_PATH.name}")
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    if not CSV_PATH.exists():
+        generuj_dane()
+
+    df = czesc_1_eksploracja()
+    df["wypelnienie"] = df["bilety_sprzedane"] / df["pojemnosc"]
+
+    WYKRESY_DIR.mkdir(exist_ok=True)
+    wykresy = {
+        "02_slupkowy_przychod_miasta": plot_przychod_wg_miasta,
+        "03a_liniowy_koncerty_miesiecznie": plot_koncerty_miesiecznie,
+        "03b_liniowy_koncerty_wg_typu": plot_koncerty_miesiecznie_wg_typu,
+        "04a_histogram_cen": plot_histogram_cen,
+        "04b_boxplot_przychodu": plot_boxplot_przychodu,
+        "05_scatter_cena_wypelnienie": plot_scatter_cena_wypelnienie,
+        "06_mapa_miast": plot_mapa_miast,
+        "07_subploty_2x2": plot_subploty,
+    }
+    for nazwa, funkcja in wykresy.items():
+        sciezka = WYKRESY_DIR / f"{nazwa}.html"
+        funkcja(df).write_html(sciezka, include_plotlyjs="cdn")
+        print(f"Zapisano wykres: {sciezka.relative_to(BASE_DIR)}")
+
+    zapisz_raport(df)
+
+
+if __name__ == "__main__":
+    main()
